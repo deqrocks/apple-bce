@@ -1,11 +1,48 @@
-# MacBook Bridge/T2 Linux Driver
-A driver for MacBook models 2018 and newer, implementing the VHCI (required for mouse/keyboard/etc.) and audio functionality.
+# apple-bce
 
-The project is divided into 3 main components:
-- BCE (Buffer Copy Engine) - this is what the files in the root directory are for. This estabilishes a basic communication channel with the T2. VHCI and Audio both require this component.
-- VHCI - this is a virtual USB host controller; keyboard, mouse and other system components are provided by this component (other drivers use this host controller to provide more functionality, however USB drivers are not in this project's scope).
-- Audio - a driver for the T2 audio interface, currently only audio output is supported.
+Buffer Copy Engine fork for Intel Macs with a T2 chip.
 
-Please note that the `master` branch does not currently support system suspend and resume.
+## Required repositories
 
-If you want to support me, you can do so by donating to me on PayPal: https://paypal.me/mcmrarm
+- `t2-upower`: `https://github.com/deqrocks/t2-upower`
+- `t2-kbd-tb`: `https://github.com/deqrocks/t2-kbd-tb`
+
+## Required kernel parameters
+
+- `pm_async=off`
+- `pcie_ports=auto`
+
+## Tested Macs
+
+- `MacBookAir8,1`
+- `MacBookAir9,1`
+- `MacBookPro15,1`
+- `MacBookPro16,1`
+- `MacBookPro16,2`
+- `MacBookPro16,4`
+- `iMac19,1`
+- `Macmini8,1`
+
+## Build
+
+```bash
+make
+```
+
+## Deploy
+
+```bash
+sudo make install
+sudo depmod -a
+```
+
+## Support
+
+If this work helps you and you want to support it:
+
+https://www.paypal.com/paypalme/negmaster
+
+## Credits
+
+- MCMrArm https://github.com/MCMrARM
+- Antoine Sidem https://github.com/clanoftheducks
