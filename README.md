@@ -13,8 +13,9 @@ The suspend fix is a set of three parts. You will need to replace stock apple-bc
 
 These kernel parameters have to be set in Linux commandline:
 
-- `pm_async=off`
-- `pcie_ports=auto`
+- `mem_sleep_default=deep` as override for hardcoded arguments (if exist)
+- `pcie_ports=auto` as override for hardcoded arguments (if exist)
+- `pm_async=off` to fix a PM race condition caused by aaudio
 
 ## Tested Macs
 
