@@ -11,6 +11,7 @@ static dev_t bce_vhci_chrdev;
 static struct class *bce_vhci_class;
 static const struct hc_driver bce_vhci_driver;
 static u16 bce_vhci_port_mask = U16_MAX;
+static const bool bce_vhci_use_stateful_sleep = false;
 
 static int bce_vhci_create_event_queues(struct bce_vhci *vhci);
 static void bce_vhci_destroy_event_queues(struct bce_vhci *vhci);
@@ -418,15 +419,62 @@ static int bce_vhci_get_frame_number(struct usb_hcd *hcd)
     return 0;
 }
 
-static int bce_vhci_bus_suspend(struct usb_hcd *hcd)
+static int bce_vhci_bus_suspend_no_state(struct usb_hcd *hcd)
 {
     struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
     pr_info("bce_vhci: suspend started\n");
 
-    /* No-state suspend tears the HCD down before sleep. */
+    /* Active suspend path tears down the HCD before sleep. */
     vhci->defer_rh_poll = false;
     pr_info("bce_vhci: suspend done (no-state hcd reinit path)\n");
     return 0;
+}
+
+/* Preserved stateful VHCI suspend path. */
+static int bce_vhci_bus_suspend_stateful(struct usb_hcd *hcd)
+{
+    int i, j;
+    int status;
+    struct bce_vhci *vhci = bce_vhci_from_hcd(hcd);
+
+    pr_info("bce_vhci: suspend started\n");
+
+    pr_info("bce_vhci: suspend endpoints\n");
+    for (i = 0; i < 16; i++) {
+        if (!vhci->port_to_device[i])
+            continue;
+        for (j = 0; j < 32; j++) {
+            if (!(vhci->devices[vhci->port_to_device[i]]->tq_mask & BIT(j)))
+                continue;
+            bce_vhci_transfer_queue_pause(&vhci->devices[vhci->port_to_device[i]]->tq[j],
+                    BCE_VHCI_PAUSE_SUSPEND);
+        }
+    }
+
+    pr_info("bce_vhci: suspend ports\n");
+    for (i = 0; i < 16; i++) {
+        if (!vhci->port_to_device[i])
+            continue;
+        bce_vhci_cmd_port_suspend(&vhci->cq, i);
+    }
+    pr_info("bce_vhci: suspend controller\n");
+    if ((status = bce_vhci_cmd_controller_pause(&vhci->cq)))
+        return status;
+
+    bce_vhci_event_queue_pause(&vhci->ev_commands);
+    bce_vhci_event_queue_pause(&vhci->ev_system);
+    bce_vhci_event_queue_pause(&vhci->ev_isochronous);
+    bce_vhci_event_queue_pause(&vhci->ev_interrupt);
+    bce_vhci_event_queue_pause(&vhci->ev_asynchronous);
+    pr_info("bce_vhci: suspend done\n");
+    return 0;
+}
+
+static int bce_vhci_bus_suspend(struct usb_hcd *hcd)
+{
+    if (bce_vhci_use_stateful_sleep)
+        return bce_vhci_bus_suspend_stateful(hcd);
+    return bce_vhci_bus_suspend_no_state(hcd);
 }
 
 static int bce_vhci_bus_resume(struct usb_hcd *hcd)
@@ -474,7 +522,7 @@ static int bce_vhci_bus_resume(struct usb_hcd *hcd)
         return status;
     }
 
-    /* Preserve the old stateful resume path for future suspend work. */
+    /* Preserved stateful resume path; inactive while no-state suspend is used. */
     pr_info("bce_vhci: resume controller\n");
     if ((status = bce_vhci_cmd_controller_start(&vhci->cq)))
         return status;
