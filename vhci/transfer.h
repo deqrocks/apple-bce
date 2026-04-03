@@ -1,6 +1,7 @@
 #ifndef BCEDRIVER_TRANSFER_H
 #define BCEDRIVER_TRANSFER_H
 
+#include <linux/wait.h>
 #include <linux/usb.h>
 #include "queue.h"
 #include "command.h"
@@ -32,6 +33,8 @@ struct bce_vhci_transfer_queue {
     struct spinlock urb_lock;
     struct mutex pause_lock;
     struct list_head giveback_urb_list;
+    wait_queue_head_t sq_out_wait_queue;
+    atomic_t sq_out_pending;
 
     struct work_struct w_reset;
 };

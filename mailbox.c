@@ -8,7 +8,7 @@
 #define REG_MBOX_REPLY_BASE 0x810
 #define REG_TIMESTAMP_BASE 0xC000
 
-#define BCE_MBOX_TIMEOUT_MS 200
+#define BCE_MBOX_TIMEOUT_MS 1000
 
 void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb)
 {
@@ -16,7 +16,7 @@ void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb)
     init_completion(&mb->mb_completion);
 }
 
-int bce_mailbox_send(struct bce_mailbox *mb, u64 msg, u64* recv)
+int bce_mailbox_send_timeout(struct bce_mailbox *mb, u64 msg, u64* recv, unsigned int timeout_ms)
 {
     u32 __iomem *regb;
 
@@ -32,7 +32,7 @@ int bce_mailbox_send(struct bce_mailbox *mb, u64 msg, u64* recv)
     iowrite32(0, regb + 2);
     iowrite32(0, regb + 3);
 
-    wait_for_completion_timeout(&mb->mb_completion, msecs_to_jiffies(BCE_MBOX_TIMEOUT_MS));
+    wait_for_completion_timeout(&mb->mb_completion, msecs_to_jiffies(timeout_ms));
     if (atomic_read(&mb->mb_status) != 2) { // Didn't get the reply
         atomic_set(&mb->mb_status, 0);
         return -ETIMEDOUT;
@@ -40,6 +40,29 @@ int bce_mailbox_send(struct bce_mailbox *mb, u64 msg, u64* recv)
 
     *recv = mb->mb_result;
     pr_debug("bce_mailbox_send: reply %llx\n", *recv);
+
+    atomic_set(&mb->mb_status, 0);
+    return 0;
+}
+
+int bce_mailbox_send(struct bce_mailbox *mb, u64 msg, u64* recv)
+{
+    return bce_mailbox_send_timeout(mb, msg, recv, BCE_MBOX_TIMEOUT_MS);
+}
+
+int bce_mailbox_send_no_reply(struct bce_mailbox *mb, u64 msg)
+{
+    u32 __iomem *regb;
+
+    if (atomic_cmpxchg(&mb->mb_status, 0, 1) != 0)
+        return -EEXIST;
+
+    pr_debug("bce_mailbox_send_no_reply: %llx\n", msg);
+    regb = (u32*) ((u8*) mb->reg_mb + REG_MBOX_OUT_BASE);
+    iowrite32((u32) msg, regb);
+    iowrite32((u32) (msg >> 32), regb + 1);
+    iowrite32(0, regb + 2);
+    iowrite32(0, regb + 3);
 
     atomic_set(&mb->mb_status, 0);
     return 0;
@@ -70,8 +93,13 @@ int bce_mailbox_handle_interrupt(struct bce_mailbox *mb)
 {
     int status = bce_mailbox_retrive_response(mb);
     if (!status) {
-        atomic_set(&mb->mb_status, 2);
-        complete(&mb->mb_completion);
+        if (atomic_read(&mb->mb_status) == 1) {
+            atomic_set(&mb->mb_status, 2);
+            complete(&mb->mb_completion);
+        } else {
+            pr_debug("bce_mailbox_handle_interrupt: unsolicited reply %llx\n", mb->mb_result);
+            atomic_set(&mb->mb_status, 0);
+        }
     }
     return status;
 }

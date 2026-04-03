@@ -33,6 +33,8 @@ enum bce_message_type {
 void bce_mailbox_init(struct bce_mailbox *mb, void __iomem *reg_mb);
 
 int bce_mailbox_send(struct bce_mailbox *mb, u64 msg, u64* recv);
+int bce_mailbox_send_timeout(struct bce_mailbox *mb, u64 msg, u64 *recv, unsigned int timeout_ms);
+int bce_mailbox_send_no_reply(struct bce_mailbox *mb, u64 msg);
 
 int bce_mailbox_handle_interrupt(struct bce_mailbox *mb);
 

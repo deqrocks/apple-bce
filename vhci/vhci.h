@@ -38,6 +38,9 @@ struct bce_vhci {
     struct workqueue_struct *tq_state_wq;
     struct work_struct w_fw_events;
     unsigned long port_change_pending;
+    bool no_state_resume;
+    bool defer_rh_poll;
+    bool hcd_registered;
 };
 
 int __init bce_vhci_module_init(void);
@@ -47,6 +50,8 @@ int bce_vhci_create(struct apple_bce_device *dev, struct bce_vhci *vhci);
 void bce_vhci_destroy(struct bce_vhci *vhci);
 int bce_vhci_start(struct usb_hcd *hcd);
 void bce_vhci_stop(struct usb_hcd *hcd);
+int bce_vhci_add_hcd(struct bce_vhci *vhci);
+void bce_vhci_remove_hcd(struct bce_vhci *vhci);
 
 struct bce_vhci *bce_vhci_from_hcd(struct usb_hcd *hcd);
 
