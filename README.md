@@ -17,6 +17,22 @@ These kernel parameters have to be set in Linux commandline:
 - `pcie_ports=auto` as override for hardcoded arguments (if exist)
 - `pm_async=off` to fix a PM race condition caused by aaudio
 
+## Notes for dGPU models
+
+On dGPU Macs, suspend may still fail or resume may take very long unless the iGPU is set as the default GPU.
+
+- Follow the iGPU setup from `https://wiki.t2linux.org/guides/hybrid-graphics/#enabling-the-igpu`
+- On Fedora, rebuild both grub and initramfs after changing kernel parameters or module config
+- If resume still hangs, try `modprobe.blacklist=amdgpu`
+- Blacklisting `amdgpu` can make suspend work, but you will lose normal dGPU use and external monitor support
+- `apple-gmux` can be used to force the iGPU as default:
+
+```bash
+echo "options apple-gmux force_igd=y" | sudo tee /etc/modprobe.d/apple-gmux.conf
+```
+
+Switch back to the dGPU default by changing `y` to `n` and rebooting.
+
 ## Tested Macs
 
 - `MacBookAir8,1`
@@ -39,9 +55,19 @@ make
 ```bash
 sudo make install
 sudo depmod -a
-sudo dracut -f # or rebuild initramfs with whatever your distro needs
 sudo reboot
 ```
+
+Rebuild grub if your distro uses grub.
+
+Rebuild initramfs if your distro includes these modules there.
+
+Example for Fedora / dracut-based distros:
+
+```bash
+sudo dracut -f
+```
+
 Don't forget to build and install the other two repos mentioned above.
 
 ## Support
