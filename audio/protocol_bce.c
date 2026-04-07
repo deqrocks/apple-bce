@@ -7,6 +7,7 @@ static void aaudio_bce_in_queue_completion(struct bce_queue_sq *sq);
 static int aaudio_bce_queue_init(struct aaudio_device *dev, struct aaudio_bce_queue *q, const char *name, int direction,
                                  bce_sq_completion cfn);
 void aaudio_bce_in_queue_submit_pending(struct aaudio_bce_queue *q, size_t count);
+static void aaudio_deferred_msg_work(struct work_struct *ws);
 
 int aaudio_bce_init(struct aaudio_device *dev)
 {
@@ -155,6 +156,20 @@ static void aaudio_bce_out_queue_completion(struct bce_queue_sq *sq)
 
 static void aaudio_bce_in_queue_handle_msg(struct aaudio_device *a, struct aaudio_msg *msg);
 
+static void aaudio_deferred_msg_work(struct work_struct *ws)
+{
+    struct aaudio_deferred_msg *work = container_of(ws, struct aaudio_deferred_msg, ws);
+    struct aaudio_msg_header *header = work->msg.data;
+
+    if (header->type == AAUDIO_MSG_TYPE_COMMAND)
+        aaudio_handle_command(work->a, &work->msg);
+    else if (header->type == AAUDIO_MSG_TYPE_NOTIFICATION)
+        aaudio_handle_notification(work->a, &work->msg);
+
+    kfree(work->msg.data);
+    kfree(work);
+}
+
 static void aaudio_bce_in_queue_completion(struct bce_queue_sq *sq)
 {
     struct aaudio_msg msg;
@@ -184,17 +199,34 @@ static void aaudio_bce_in_queue_completion(struct bce_queue_sq *sq)
 static void aaudio_bce_in_queue_handle_msg(struct aaudio_device *a, struct aaudio_msg *msg)
 {
     struct aaudio_msg_header *header = (struct aaudio_msg_header *) msg->data;
+    struct aaudio_deferred_msg *work;
+
     if (msg->size < sizeof(struct aaudio_msg_header)) {
         pr_err("aaudio: Msg size smaller than header (%lx)", msg->size);
         return;
     }
     if (header->type == AAUDIO_MSG_TYPE_RESPONSE) {
         aaudio_handle_reply(&a->bcem, msg);
-    } else if (header->type == AAUDIO_MSG_TYPE_COMMAND) {
-        aaudio_handle_command(a, msg);
-    } else if (header->type == AAUDIO_MSG_TYPE_NOTIFICATION) {
-        aaudio_handle_notification(a, msg);
+        return;
     }
+
+    work = kzalloc(sizeof(*work), GFP_ATOMIC);
+    if (!work) {
+        pr_err("aaudio: Failed to allocate deferred message work\n");
+        return;
+    }
+
+    work->msg.data = kmemdup(msg->data, msg->size, GFP_ATOMIC);
+    if (!work->msg.data) {
+        kfree(work);
+        pr_err("aaudio: Failed to copy deferred message\n");
+        return;
+    }
+
+    work->a = a;
+    work->msg.size = msg->size;
+    INIT_WORK(&work->ws, aaudio_deferred_msg_work);
+    schedule_work(&work->ws);
 }
 
 void aaudio_bce_in_queue_submit_pending(struct aaudio_bce_queue *q, size_t count)

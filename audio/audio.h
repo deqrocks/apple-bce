@@ -2,6 +2,7 @@
 #define AAUDIO_H
 
 #include <linux/types.h>
+#include <linux/workqueue.h>
 #include <sound/pcm.h>
 #include "../apple_bce.h"
 #include "protocol_bce.h"
@@ -48,6 +49,13 @@ struct aaudio_buffer_struct {
 };
 
 struct aaudio_device;
+
+struct aaudio_deferred_msg {
+    struct work_struct ws;
+    struct aaudio_device *a;
+    struct aaudio_msg msg;
+};
+
 struct aaudio_dma_buf {
     dma_addr_t dma_addr;
     void *ptr;
