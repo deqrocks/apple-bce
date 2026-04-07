@@ -20,6 +20,8 @@ static int aaudio_init_cmd(struct aaudio_device *a);
 static int aaudio_init_bs(struct aaudio_device *a);
 static void aaudio_init_dev(struct aaudio_device *a, aaudio_device_id_t dev_id);
 static void aaudio_free_dev(struct aaudio_subdevice *sdev);
+static void aaudio_reset_stream(struct aaudio_stream *stream);
+static void aaudio_reset_streams(struct aaudio_device *a);
 
 static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
@@ -198,7 +200,31 @@ static int aaudio_resume(struct device *dev)
         return status;
     }
 
+    if (aaudio->bce->vhci.no_state_resume)
+        aaudio_reset_streams(aaudio);
+
     return 0;
+}
+
+static void aaudio_reset_stream(struct aaudio_stream *stream)
+{
+    stream->started = 0;
+    stream->waiting_for_first_ts = true;
+    stream->remote_timestamp = 0;
+    stream->frame_min = stream->latency;
+}
+
+static void aaudio_reset_streams(struct aaudio_device *a)
+{
+    struct aaudio_subdevice *sdev;
+    size_t i;
+
+    list_for_each_entry(sdev, &a->subdevice_list, list) {
+        for (i = 0; i < sdev->in_stream_cnt; i++)
+            aaudio_reset_stream(&sdev->in_streams[i]);
+        for (i = 0; i < sdev->out_stream_cnt; i++)
+            aaudio_reset_stream(&sdev->out_streams[i]);
+    }
 }
 
 static int aaudio_init_cmd(struct aaudio_device *a)
