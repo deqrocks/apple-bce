@@ -62,7 +62,8 @@ static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
         status = PTR_ERR(aaudio_class);
         goto fail;
     }
-    device_link_add(aaudio->dev, aaudio->bce->dev, DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER);
+    device_link_add(&dev->dev, &aaudio->bce->pci->dev,
+            DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER);
 
     init_completion(&aaudio->remote_alive);
     INIT_LIST_HEAD(&aaudio->subdevice_list);
