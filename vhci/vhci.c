@@ -18,6 +18,7 @@ static void bce_vhci_destroy_event_queues(struct bce_vhci *vhci);
 static int bce_vhci_create_message_queues(struct bce_vhci *vhci);
 static void bce_vhci_destroy_message_queues(struct bce_vhci *vhci);
 static void bce_vhci_handle_firmware_events_w(struct work_struct *ws);
+static void bce_vhci_add_hcd_w(struct work_struct *ws);
 static void bce_vhci_firmware_event_completion(struct bce_queue_sq *sq);
 static int bce_vhci_start_controller(struct bce_vhci *vhci);
 static void bce_vhci_forget_devices(struct bce_vhci *vhci);
@@ -45,6 +46,7 @@ int bce_vhci_create(struct apple_bce_device *dev, struct bce_vhci *vhci)
 
     vhci->tq_state_wq = alloc_ordered_workqueue("bce-vhci-tq-state", 0);
     INIT_WORK(&vhci->w_fw_events, bce_vhci_handle_firmware_events_w);
+    INIT_WORK(&vhci->w_add_hcd, bce_vhci_add_hcd_w);
 
     vhci->hcd = usb_create_hcd(&bce_vhci_driver, vhci->vdev, "bce-vhci");
     if (!vhci->hcd) {
@@ -77,6 +79,7 @@ fail_dev:
 
 void bce_vhci_destroy(struct bce_vhci *vhci)
 {
+    cancel_work_sync(&vhci->w_add_hcd);
     bce_vhci_remove_hcd(vhci);
     bce_vhci_destroy_event_queues(vhci);
     bce_vhci_destroy_message_queues(vhci);
@@ -102,10 +105,26 @@ int bce_vhci_add_hcd(struct bce_vhci *vhci)
 
 void bce_vhci_remove_hcd(struct bce_vhci *vhci)
 {
+    cancel_work_sync(&vhci->w_add_hcd);
     if (!vhci->hcd_registered)
         return;
     usb_remove_hcd(vhci->hcd);
     vhci->hcd_registered = false;
+}
+
+static void bce_vhci_add_hcd_w(struct work_struct *ws)
+{
+    struct bce_vhci *vhci = container_of(ws, struct bce_vhci, w_add_hcd);
+    int status;
+
+    pr_info("bce-vhci: deferred HCD add after no-state wake\n");
+    status = bce_vhci_add_hcd(vhci);
+    if (status) {
+        pr_err("bce-vhci: deferred HCD add failed: %d\n", status);
+        return;
+    }
+
+    vhci->no_state_resume = false;
 }
 
 struct bce_vhci *bce_vhci_from_hcd(struct usb_hcd *hcd)

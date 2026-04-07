@@ -193,12 +193,14 @@ static irqreturn_t bce_handle_mb_irq(int irq, void *dev)
 static irqreturn_t bce_handle_dma_irq(int irq, void *dev)
 {
     int i;
+    size_t ce = 0;
     struct apple_bce_device *bce = pci_get_drvdata(dev);
     spin_lock(&bce->queues_lock);
     for (i = 0; i < BCE_MAX_QUEUE_COUNT; i++)
         if (bce->queues[i] && bce->queues[i]->type == BCE_QUEUE_CQ)
-            bce_handle_cq_completions(bce, (struct bce_queue_cq *) bce->queues[i]);
+            bce_handle_cq_completions_locked(bce, (struct bce_queue_cq *) bce->queues[i], &ce);
     spin_unlock(&bce->queues_lock);
+    bce_dispatch_pending_sq_completions(bce, ce);
     return IRQ_HANDLED;
 }
 
@@ -402,18 +404,21 @@ static int apple_bce_resume(struct device *dev)
     if ((status = bce_resume_selected(bce)))
         return status;
 
-    if (bce->vhci.no_state_resume) {
-        /* No-state wake rebuilds VHCI from a fresh HCD registration. */
-        pr_info("apple-bce: resume: re-adding VHCI HCD after no-state wake\n");
-        status = bce_vhci_add_hcd(&bce->vhci);
-        if (status)
-            return status;
-        bce->vhci.no_state_resume = false;
-    }
-
     bce_timestamp_start(&bce->timestamp, false);
 
     return 0;
+}
+
+static void apple_bce_complete(struct device *dev)
+{
+    struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
+
+    if (!bce->vhci.no_state_resume)
+        return;
+
+    /* Re-add the VHCI HCD after the PM core completed resume ordering. */
+    pr_info("apple-bce: complete: scheduling VHCI HCD re-add after no-state wake\n");
+    queue_work(bce->vhci.tq_state_wq, &bce->vhci.w_add_hcd);
 }
 
 static struct pci_device_id apple_bce_ids[  ] = {
@@ -425,7 +430,8 @@ MODULE_DEVICE_TABLE(pci, apple_bce_ids);
 
 struct dev_pm_ops apple_bce_pci_driver_pm = {
         .suspend = apple_bce_suspend,
-        .resume = apple_bce_resume
+        .resume = apple_bce_resume,
+        .complete = apple_bce_complete
 };
 struct pci_driver apple_bce_pci_driver = {
         .name = "apple-bce",

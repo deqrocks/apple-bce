@@ -68,11 +68,9 @@ static void bce_handle_cq_completion(struct apple_bce_device *dev, struct bce_qe
     target_sq->completion_tail = (target_sq->completion_tail + 1) % target_sq->el_count;
 }
 
-void bce_handle_cq_completions(struct apple_bce_device *dev, struct bce_queue_cq *cq)
+void bce_handle_cq_completions_locked(struct apple_bce_device *dev, struct bce_queue_cq *cq, size_t *ce)
 {
-    size_t ce = 0;
     struct bce_qe_completion *e;
-    struct bce_queue_sq *sq;
     e = bce_cq_element(cq, cq->index);
     if (!(e->flags & BCE_COMPLETION_FLAG_PENDING))
         return;
@@ -82,12 +80,18 @@ void bce_handle_cq_completions(struct apple_bce_device *dev, struct bce_queue_cq
         if (!(e->flags & BCE_COMPLETION_FLAG_PENDING))
             break;
         // pr_info("apple-bce: compl: %i: %i %llx %llx", e->qid, e->status, e->data_size, e->result);
-        bce_handle_cq_completion(dev, e, &ce);
+        bce_handle_cq_completion(dev, e, ce);
         e->flags = 0;
         cq->index = (cq->index + 1) % cq->el_count;
     }
     mb();
     iowrite32(cq->index, (u32 *) ((u8 *) dev->reg_mem_dma +  REG_DOORBELL_BASE) + cq->qid);
+}
+
+void bce_dispatch_pending_sq_completions(struct apple_bce_device *dev, size_t ce)
+{
+    struct bce_queue_sq *sq;
+
     while (ce) {
         --ce;
         sq = dev->int_sq_list[ce];

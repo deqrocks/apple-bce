@@ -37,6 +37,7 @@ struct bce_vhci {
     struct bce_vhci_device *devices[16];
     struct workqueue_struct *tq_state_wq;
     struct work_struct w_fw_events;
+    struct work_struct w_add_hcd;
     unsigned long port_change_pending;
     bool no_state_resume;
     bool defer_rh_poll;
