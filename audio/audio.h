@@ -118,6 +118,8 @@ struct aaudio_device {
     int next_alsa_id;
 
     struct completion remote_alive;
+    struct work_struct resume_work;
+    bool resume_deferred;
 };
 
 void aaudio_handle_notification(struct aaudio_device *a, struct aaudio_msg *msg);
@@ -127,6 +129,7 @@ void aaudio_handle_command(struct aaudio_device *a, struct aaudio_msg *msg);
 
 int aaudio_module_init(void);
 void aaudio_module_exit(void);
+void aaudio_resume_post_vhci(struct aaudio_device *a);
 
 extern struct aaudio_alsa_pcm_id_mapping aaudio_alsa_id_mappings[];
 

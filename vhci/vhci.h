@@ -33,15 +33,23 @@ struct bce_vhci {
     u16 port_mask;
     u8 port_count;
     u16 port_power_mask;
-    bce_vhci_device_t port_to_device[16];
-    struct bce_vhci_device *devices[16];
+    bce_vhci_device_t port_to_device[17];
+    struct bce_vhci_device *devices[17];
     struct workqueue_struct *tq_state_wq;
     struct work_struct w_fw_events;
     struct work_struct w_add_hcd;
+    struct delayed_work w_port_status_change;
     unsigned long port_change_pending;
+    unsigned long port_change_waiting;
+    /* Port-local resume request armed by a failed first EP0 transfer. */
+    unsigned long port_resume_requested;
+    /* Pass-1 port resume was sent; pass 2 may resume queues after settle time. */
+    unsigned long port_resume_pass1_done;
+    u8 port_resume_tries[17];
     bool no_state_resume;
-    bool defer_rh_poll;
     bool hcd_registered;
+    bool system_suspending;
+    bool stateful_resume_gating;
 };
 
 int __init bce_vhci_module_init(void);

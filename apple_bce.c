@@ -1,12 +1,13 @@
 #include "apple_bce.h"
 #include <linux/module.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include "audio/audio.h"
 #include <linux/version.h>
 
 static dev_t bce_chrdev;
 static struct class *bce_class;
-static const bool bce_use_stateful_sleep = false;
+static const bool bce_use_stateful_sleep = true;
 
 struct apple_bce_device *global_bce;
 
@@ -16,6 +17,38 @@ static irqreturn_t bce_handle_mb_irq(int irq, void *dev);
 static irqreturn_t bce_handle_dma_irq(int irq, void *dev);
 static int bce_fw_version_handshake(struct apple_bce_device *bce);
 static int bce_register_command_queue(struct apple_bce_device *bce, struct bce_queue_memcfg *cfg, int is_sq);
+static int bce_alloc_state_buffer(struct apple_bce_device *bce);
+static void bce_free_state_buffer(struct apple_bce_device *bce);
+static int bce_pm_suspend_prepare(struct apple_bce_device *bce);
+static void bce_pm_suspend_abort(struct apple_bce_device *bce);
+static void bce_pm_resume_finish(struct apple_bce_device *bce);
+
+static int bce_alloc_state_buffer(struct apple_bce_device *bce)
+{
+    /* Windows mba9,1/mbp16,1 keeps a persistent 0x2000 state buffer for device lifetime. */
+    bce->saved_data_dma_size = 0x2000;
+    bce->saved_data_dma_ptr = dma_alloc_coherent(&bce->pci->dev, bce->saved_data_dma_size,
+            &bce->saved_data_dma_addr, GFP_KERNEL);
+    if (!bce->saved_data_dma_ptr) {
+        bce->saved_data_dma_size = 0;
+        bce->saved_data_dma_addr = 0;
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static void bce_free_state_buffer(struct apple_bce_device *bce)
+{
+    if (!bce->saved_data_dma_ptr)
+        return;
+
+    dma_free_coherent(&bce->pci->dev, bce->saved_data_dma_size,
+            bce->saved_data_dma_ptr, bce->saved_data_dma_addr);
+    bce->saved_data_dma_ptr = NULL;
+    bce->saved_data_dma_addr = 0;
+    bce->saved_data_dma_size = 0;
+}
 
 static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
@@ -63,10 +96,12 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
     }
 
     bce_mailbox_init(&bce->mbox, bce->reg_mem_mb);
-    bce_timestamp_init(&bce->timestamp, bce->reg_mem_mb);
+    bce_xhci_pm_init(&bce->xhci_pm, bce->reg_mem_mb);
 
     spin_lock_init(&bce->queues_lock);
     ida_init(&bce->queue_ida);
+    mutex_init(&bce->pm_lock);
+    bce->mailbox_channel_active = true;
 
     if ((status = pci_request_irq(dev, 0, bce_handle_mb_irq, NULL, dev, "bce_mbox")))
         goto fail;
@@ -77,6 +112,9 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
         dev_warn(&dev->dev, "dma: Setting mask failed\n");
         goto fail_interrupt;
     }
+
+    if ((status = bce_alloc_state_buffer(bce)))
+        goto fail_interrupt;
 
     /* Gets the function 0's interface. This is needed because Apple only accepts DMA on our function if function 0
        is a bus master, so we need to work around this. */
@@ -89,7 +127,8 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
 #endif
     pci_set_master(bce->pci0);
 
-    bce_timestamp_start(&bce->timestamp, true);
+    /* Windows device start writes the opaque -4 XHCI sentinel before the controller is considered active. */
+    bce_xhci_pm_start(&bce->xhci_pm, true);
 
     if ((status = bce_fw_version_handshake(bce)))
         goto fail_ts;
@@ -107,7 +146,8 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
     return 0;
 
 fail_ts:
-    bce_timestamp_stop(&bce->timestamp);
+    bce_free_state_buffer(bce);
+    bce_xhci_pm_stop(&bce->xhci_pm);
 #ifndef WITHOUT_NVME_PATCH
     pci_disable_device(bce->pci0);
 fail_dev0:
@@ -207,17 +247,95 @@ static irqreturn_t bce_handle_dma_irq(int irq, void *dev)
 static int bce_fw_version_handshake(struct apple_bce_device *bce)
 {
     u64 result;
+    u32 fw_version;
     int status;
 
     if ((status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_SET_FW_PROTOCOL_VERSION, BC_PROTOCOL_VERSION),
             &result)))
         return status;
+    fw_version = (u32) BCE_MB_VALUE(result);
     if (BCE_MB_TYPE(result) != BCE_MB_SET_FW_PROTOCOL_VERSION ||
-        BCE_MB_VALUE(result) != BC_PROTOCOL_VERSION) {
+        fw_version > BC_PROTOCOL_VERSION) {
         pr_err("apple-bce: FW version handshake failed %x:%llx\n", BCE_MB_TYPE(result), BCE_MB_VALUE(result));
         return -EINVAL;
     }
+    bce->fw_version = fw_version;
     return 0;
+}
+
+static bool bce_stateful_supported(struct apple_bce_device *bce)
+{
+    /* Windows mba9,1/mbp16,1 gates stateful sleep and wake on negotiated protocol version >= 0x20001. */
+    return bce_use_stateful_sleep && bce->fw_version >= BC_PROTOCOL_VERSION;
+}
+
+static int bce_pm_wait_mailbox_idle(struct apple_bce_device *bce)
+{
+    int retries = 100;
+
+    while (atomic_read(&bce->mbox.mb_status) != 0) {
+        if (!--retries) {
+            pr_err("apple-bce: timeout waiting for BCE mailbox channel to quiesce\n");
+            return -ETIMEDOUT;
+        }
+        usleep_range(5000, 10000);
+    }
+
+    return 0;
+}
+
+static int bce_pm_channel_pause(struct apple_bce_device *bce)
+{
+    int status;
+
+    status = bce_mailbox_channel_pause(&bce->mbox);
+    if (status)
+        return status;
+
+    status = bce_pm_wait_mailbox_idle(bce);
+
+    if (status)
+        bce_mailbox_channel_resume(&bce->mbox);
+    if (status)
+        return status;
+
+    /* Windows vtable +0x100 drains the BCE channel before the suspend callback. */
+    bce->mailbox_channel_active = false;
+    return 0;
+}
+
+static void bce_pm_channel_resume(struct apple_bce_device *bce)
+{
+    /* Windows vtable +0x108 marks the BCE channel active again after wake completes. */
+    bce->mailbox_channel_active = true;
+    bce_mailbox_channel_resume(&bce->mbox);
+}
+
+static int bce_pm_suspend_prepare(struct apple_bce_device *bce)
+{
+    int status;
+
+    status = bce_pm_channel_pause(bce);
+    if (status)
+        return status;
+
+    /* Windows suspend unconditionally writes the opaque -2 XHCI sentinel before 0x17/0x14. */
+    bce_xhci_pm_stop(&bce->xhci_pm);
+    return 0;
+}
+
+static void bce_pm_suspend_abort(struct apple_bce_device *bce)
+{
+    /* Failed suspend must unwind the wrapper order back to the running state. */
+    bce_xhci_pm_start(&bce->xhci_pm, false);
+    bce_pm_channel_resume(bce);
+}
+
+static void bce_pm_resume_finish(struct apple_bce_device *bce)
+{
+    /* Windows resume unconditionally writes the opaque -3 XHCI sentinel after 0x18/0x15. */
+    bce_xhci_pm_start(&bce->xhci_pm, false);
+    bce_pm_channel_resume(bce);
 }
 
 static int bce_register_command_queue(struct apple_bce_device *bce, struct bce_queue_memcfg *cfg, int is_sq)
@@ -246,7 +364,8 @@ static void apple_bce_remove(struct pci_dev *dev)
 
     bce_vhci_destroy(&bce->vhci);
 
-    bce_timestamp_stop(&bce->timestamp);
+    bce_free_state_buffer(bce);
+    bce_xhci_pm_stop(&bce->xhci_pm);
 #ifndef WITHOUT_NVME_PATCH
     pci_disable_device(bce->pci0);
 #endif
@@ -263,80 +382,58 @@ static void apple_bce_remove(struct pci_dev *dev)
     kfree(bce);
 }
 
-static int bce_suspend_no_state(struct apple_bce_device *bce)
+static int bce_pm_suspend_fallback_no_state(struct apple_bce_device *bce)
 {
-    /* Active suspend path is no-state only. */
-    bce->saved_data_dma_addr = 0;
-    bce->saved_data_dma_ptr = NULL;
-    bce->saved_data_dma_size = 0;
-
     pr_info("apple-bce: suspend: forcing SLEEP_NO_STATE (no reply expected)\n");
-    if (bce_mailbox_send_no_reply(&bce->mbox, BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0))) {
+    if (bce_mailbox_send_no_reply_locked(&bce->mbox, BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0))) {
         pr_err("apple-bce: suspend: SLEEP_NO_STATE send failed\n");
         return -EIO;
     }
-
-    bce->vhci.no_state_resume = true;
     return 0;
 }
 
-/* Preserved stateful suspend path. */
-static int bce_suspend_stateful(struct apple_bce_device *bce)
-{
-    int attempt, status = 0;
-    u64 resp;
-    dma_addr_t dma_addr;
-    void *dma_ptr = NULL;
-    size_t size = max(PAGE_SIZE, 4096UL);
-
-    for (attempt = 0; attempt < 5; ++attempt) {
-        pr_debug("apple-bce: suspend: attempt %i, buffer size %li\n", attempt, size);
-        dma_ptr = dma_alloc_coherent(&bce->pci->dev, size, &dma_addr, GFP_KERNEL);
-        if (!dma_ptr) {
-            pr_err("apple-bce: suspend failed (data alloc failed)\n");
-            break;
-        }
-        BUG_ON((dma_addr % 4096) != 0);
-        status = bce_mailbox_send(&bce->mbox,
-                BCE_MB_MSG(BCE_MB_SAVE_STATE_AND_SLEEP, (dma_addr & ~(4096LLU - 1)) | (size / 4096)), &resp);
-        if (status) {
-            pr_err("apple-bce: suspend failed (mailbox send)\n");
-            break;
-        }
-        if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_RESTORE_STATE_COMPLETE) {
-            bce->saved_data_dma_addr = dma_addr;
-            bce->saved_data_dma_ptr = dma_ptr;
-            bce->saved_data_dma_size = size;
-            return 0;
-        } else if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_STATE_AND_SLEEP_FAILURE) {
-            dma_free_coherent(&bce->pci->dev, size, dma_ptr, dma_addr);
-            size = (BCE_MB_VALUE(resp) + 0x10ff) & ~(4096LLU - 1);
-            pr_debug("apple-bce: suspend: device requested a larger buffer (%li)\n", size);
-            continue;
-        } else {
-            pr_err("apple-bce: suspend failed (invalid device response)\n");
-            status = -EINVAL;
-            break;
-        }
-    }
-    if (dma_ptr)
-        dma_free_coherent(&bce->pci->dev, size, dma_ptr, dma_addr);
-    return status;
-}
-
-static int bce_suspend_selected(struct apple_bce_device *bce)
-{
-    if (bce_use_stateful_sleep)
-        return bce_suspend_stateful(bce);
-    return bce_suspend_no_state(bce);
-}
-
-static int bce_resume_no_state(struct apple_bce_device *bce)
+static int bce_pm_suspend_try_state(struct apple_bce_device *bce)
 {
     int status;
     u64 resp;
 
-    if ((status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp))) {
+    /* Windows mba9,1/mbp16,1 tries stateful first and decides fallback from the 0x17 reply. */
+    bce->stateful_suspend_valid = false;
+
+    if (!bce->saved_data_dma_ptr || !bce->saved_data_dma_addr || !bce->saved_data_dma_size) {
+        pr_err("apple-bce: suspend failed (persistent state buffer missing)\n");
+        return -ENOMEM;
+    }
+
+    BUG_ON((bce->saved_data_dma_addr % 4096) != 0);
+    status = bce_mailbox_send_locked(&bce->mbox,
+            BCE_MB_MSG(BCE_MB_SAVE_STATE_AND_SLEEP,
+                    (bce->saved_data_dma_addr & ~(4096LLU - 1)) | (bce->saved_data_dma_size / 4096)),
+            &resp);
+    if (status) {
+        pr_err("apple-bce: suspend failed (mailbox send)\n");
+        return status;
+    }
+
+    if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_RESTORE_STATE_COMPLETE) {
+        pr_info("apple-bce: suspend: remote response: restore state saved  \n");
+        bce->stateful_suspend_valid = true;
+        return 0;
+    }
+
+    if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_STATE_AND_SLEEP_REJECTED) {
+        pr_err("apple-bce: remote rejected stateful suspend payload\n");
+        return -EAGAIN;
+    }
+    return -EINVAL;
+}
+
+static int bce_pm_resume_no_state(struct apple_bce_device *bce)
+{
+    int status;
+    u64 resp;
+
+    if ((status = bce_mailbox_send_locked(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_NO_STATE, 0), &resp))) {
         pr_err("apple-bce: resume with no state failed (mailbox send)\n");
         return status;
     }
@@ -347,34 +444,22 @@ static int bce_resume_no_state(struct apple_bce_device *bce)
     return 0;
 }
 
-/* Preserved stateful resume path. */
-static int bce_resume_stateful(struct apple_bce_device *bce)
+static int bce_pm_resume_stateful(struct apple_bce_device *bce)
 {
     int status;
     u64 resp;
 
-    if ((status = bce_mailbox_send(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_STATE_AND_WAKE,
+    if ((status = bce_mailbox_send_locked(&bce->mbox, BCE_MB_MSG(BCE_MB_RESTORE_STATE_AND_WAKE,
             (bce->saved_data_dma_addr & ~(4096LLU - 1)) | (bce->saved_data_dma_size / 4096)), &resp))) {
         pr_err("apple-bce: resume with state failed (mailbox send)\n");
-        goto finish_with_state;
+        return status;
     }
     if (BCE_MB_TYPE(resp) != BCE_MB_SAVE_RESTORE_STATE_COMPLETE) {
         pr_err("apple-bce: resume with state failed (invalid device response)\n");
-        status = -EINVAL;
-        goto finish_with_state;
+        return -EINVAL;
     }
 
-finish_with_state:
-    dma_free_coherent(&bce->pci->dev, bce->saved_data_dma_size, bce->saved_data_dma_ptr, bce->saved_data_dma_addr);
-    bce->saved_data_dma_ptr = NULL;
-    return status;
-}
-
-static int bce_resume_selected(struct apple_bce_device *bce)
-{
-    if (bce_use_stateful_sleep)
-        return bce_resume_stateful(bce);
-    return bce_resume_no_state(bce);
+    return 0;
 }
 
 static int apple_bce_suspend(struct device *dev)
@@ -382,43 +467,107 @@ static int apple_bce_suspend(struct device *dev)
     struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
     int status;
 
-    bce_timestamp_stop(&bce->timestamp);
+    pr_info("apple-bce: suspend: entry\n");
+    mutex_lock(&bce->pm_lock);
 
-    pr_info("apple-bce: suspend: removing VHCI HCD for no-state sleep\n");
+    bce->stateful_suspend_valid = false;
+    bce->no_state_fallback = false;
+    bce->vhci.no_state_resume = false;
+
+    status = bce_pm_suspend_prepare(bce);
+    if (status)
+        goto out_unlock;
+
+    if (!bce_stateful_supported(bce)) {
+        /* No-state keeps the current Linux HCD teardown path until the Windows no-state path is rebuilt separately. */
+        bce_vhci_remove_hcd(&bce->vhci);
+        status = bce_pm_suspend_fallback_no_state(bce);
+        if (!status) {
+            bce->no_state_fallback = true;
+            bce->vhci.no_state_resume = true;
+        } else {
+            bce_pm_suspend_abort(bce);
+        }
+        goto out_unlock;
+    }
+
+    status = bce_pm_suspend_try_state(bce);
+    if (!status)
+        goto out_unlock;
+
+    if (status != -EAGAIN) {
+        bce_pm_suspend_abort(bce);
+        goto out_unlock;
+    }
+
+    /* Current Linux path treats the traced 0x19 not-ready reply as stateful reject. */
+    pr_info("apple-bce: suspend: stateful path not ready, falling back to no-state\n");
     bce_vhci_remove_hcd(&bce->vhci);
+    status = bce_pm_suspend_fallback_no_state(bce);
+    if (!status) {
+        bce->no_state_fallback = true;
+        bce->vhci.no_state_resume = true;
+    } else {
+        bce_pm_suspend_abort(bce);
+    }
 
-    if ((status = bce_suspend_selected(bce)))
-        return status;
-
-    return 0;
+out_unlock:
+    mutex_unlock(&bce->pm_lock);
+    pr_info("apple-bce: suspend: exit status=%d stateful_valid=%d no_state_resume=%d no_state_fallback=%d\n",
+            status, bce->stateful_suspend_valid, bce->vhci.no_state_resume, bce->no_state_fallback);
+    return status;
 }
 
 static int apple_bce_resume(struct device *dev)
 {
     struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
     int status;
+    bool used_stateful;
+
+    pr_info("apple-bce: resume: entry\n");
+    mutex_lock(&bce->pm_lock);
 
     pci_set_master(bce->pci);
     pci_set_master(bce->pci0);
 
-    if ((status = bce_resume_selected(bce)))
-        return status;
+    /* Windows resumes from the suspend result, not a preselected mode. */
+    used_stateful = bce_stateful_supported(bce) && bce->stateful_suspend_valid;
+    pr_info("apple-bce: resume path: %s\n", used_stateful ? "stateful" : "no-state");
+    if (used_stateful)
+        status = bce_pm_resume_stateful(bce);
+    else
+        status = bce_pm_resume_no_state(bce);
+    if (status)
+        goto out_unlock;
 
-    bce_timestamp_start(&bce->timestamp, false);
+    if (used_stateful)
+        bce->stateful_suspend_valid = false;
 
-    return 0;
+    bce_pm_resume_finish(bce);
+
+out_unlock:
+    mutex_unlock(&bce->pm_lock);
+    pr_info("apple-bce: resume: exit status=%d path=%s stateful_valid=%d no_state_resume=%d no_state_fallback=%d\n",
+            status, used_stateful ? "stateful" : "no-state",
+            bce->stateful_suspend_valid, bce->vhci.no_state_resume, bce->no_state_fallback);
+    return status;
 }
 
 static void apple_bce_complete(struct device *dev)
 {
     struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
 
-    if (!bce->vhci.no_state_resume)
-        return;
+    pr_info("apple-bce: complete: entry no_state_fallback=%d no_state_resume=%d\n",
+            bce->no_state_fallback, bce->vhci.no_state_resume);
+    if (bce->no_state_fallback && bce->vhci.no_state_resume) {
+        /* Re-add the VHCI HCD after the PM core completed resume ordering. */
+        pr_info("apple-bce: complete: scheduling VHCI HCD re-add after no-state wake\n");
+        queue_work(bce->vhci.tq_state_wq, &bce->vhci.w_add_hcd);
+        bce->no_state_fallback = false;
+    }
 
-    /* Re-add the VHCI HCD after the PM core completed resume ordering. */
-    pr_info("apple-bce: complete: scheduling VHCI HCD re-add after no-state wake\n");
-    queue_work(bce->vhci.tq_state_wq, &bce->vhci.w_add_hcd);
+    aaudio_resume_post_vhci(bce->aaudio);
+    pr_info("apple-bce: complete: exit\n");
 }
 
 static struct pci_device_id apple_bce_ids[  ] = {
@@ -495,6 +644,6 @@ static void __exit apple_bce_module_exit(void)
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("MrARM");
 MODULE_DESCRIPTION("Apple BCE Driver");
-MODULE_VERSION("0.02");
+MODULE_VERSION("0.03");
 module_init(apple_bce_module_init);
 module_exit(apple_bce_module_exit);

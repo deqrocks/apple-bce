@@ -1,21 +1,14 @@
 # apple-bce
 
-Buffer Copy Engine fork for Intel Macs with a T2 chip.
-
-## Required repositories
-
-The suspend fix is a set of three parts. You will need to replace stock apple-bce with this fork. Additionally you will need the following forks:
-
-- `t2-upower`: `https://github.com/deqrocks/t2-upower`
-- `t2-kbd-tb`: `https://github.com/deqrocks/t2-kbd-tb`
+Buffer Copy Engine fork for Intel Macs with a T2 chip with stateful and no-state resume support.
 
 ## Required kernel parameters
 
 These kernel parameters have to be set in Linux commandline:
 
-- `mem_sleep_default=deep` as override for hardcoded arguments (if exist)
+- `mem_sleep_default=deep` This is S3. S2 and 4 should also work
 - `pcie_ports=auto` as override for hardcoded arguments (if exist)
-- `pm_async=off` to fix a PM race condition caused by aaudio
+
 
 ## Notes for dGPU models
 

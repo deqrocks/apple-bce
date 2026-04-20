@@ -22,6 +22,7 @@ static void aaudio_init_dev(struct aaudio_device *a, aaudio_device_id_t dev_id);
 static void aaudio_free_dev(struct aaudio_subdevice *sdev);
 static void aaudio_reset_stream(struct aaudio_stream *stream);
 static void aaudio_reset_streams(struct aaudio_device *a);
+static void aaudio_resume_work(struct work_struct *ws);
 
 static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
@@ -55,6 +56,7 @@ static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     aaudio->pci = dev;
     pci_set_drvdata(dev, aaudio);
+    aaudio->bce->aaudio = aaudio;
 
     aaudio->devt = aaudio_chrdev;
     aaudio->dev = device_create(aaudio_class, &dev->dev, aaudio->devt, NULL, "aaudio");
@@ -66,6 +68,7 @@ static int aaudio_probe(struct pci_dev *dev, const struct pci_device_id *id)
             DL_FLAG_PM_RUNTIME | DL_FLAG_AUTOREMOVE_CONSUMER);
 
     init_completion(&aaudio->remote_alive);
+    INIT_WORK(&aaudio->resume_work, aaudio_resume_work);
     INIT_LIST_HEAD(&aaudio->subdevice_list);
 
     /* Init: set an unknown flag in the bitset */
@@ -161,6 +164,9 @@ static void aaudio_remove(struct pci_dev *dev)
     struct aaudio_subdevice *sdev;
     struct aaudio_device *aaudio = pci_get_drvdata(dev);
 
+    cancel_work_sync(&aaudio->resume_work);
+    if (aaudio->bce && aaudio->bce->aaudio == aaudio)
+        aaudio->bce->aaudio = NULL;
     snd_card_free(aaudio->card);
     while (!list_empty(&aaudio->subdevice_list)) {
         sdev = list_first_entry(&aaudio->subdevice_list, struct aaudio_subdevice, list);
@@ -179,11 +185,19 @@ static void aaudio_remove(struct pci_dev *dev)
 static int aaudio_suspend(struct device *dev)
 {
     struct aaudio_device *aaudio = pci_get_drvdata(to_pci_dev(dev));
+    int status;
 
-    if (aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF))
+    cancel_work_sync(&aaudio->resume_work);
+    aaudio->resume_deferred = false;
+
+    dev_info(aaudio->dev, "suspend entry\n");
+
+    status = aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_OFF);
+    if (status)
         dev_warn(aaudio->dev, "Failed to reset remote access\n");
 
     pci_disable_device(aaudio->pci);
+    dev_info(aaudio->dev, "suspend exit status=%d\n", status);
     return 0;
 }
 
@@ -191,20 +205,53 @@ static int aaudio_resume(struct device *dev)
 {
     int status;
     struct aaudio_device *aaudio = pci_get_drvdata(to_pci_dev(dev));
+    const char *path = aaudio->bce->vhci.no_state_resume ? "no-state" : "stateful";
 
     if ((status = pci_enable_device(aaudio->pci)))
         return status;
     pci_set_master(aaudio->pci);
+    
+    /* we are deferring aaudio resume here until vhci is finished*/
+    if (!aaudio->bce->vhci.no_state_resume) {
+        aaudio->resume_deferred = true;
+        return 0;
+    }
 
     if ((status = aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_ON))) {
         dev_err(aaudio->dev, "Failed to set remote access\n");
         return status;
     }
 
-    if (aaudio->bce->vhci.no_state_resume)
-        aaudio_reset_streams(aaudio);
+    aaudio->resume_deferred = false;
+    aaudio_reset_streams(aaudio);
 
+    dev_info(aaudio->dev, "resume exit status=0 path=%s\n", path);
     return 0;
+}
+
+static void aaudio_resume_work(struct work_struct *ws)
+{
+    struct aaudio_device *aaudio = container_of(ws, struct aaudio_device, resume_work);
+
+    if (!aaudio->resume_deferred)
+        return;
+
+    if (aaudio_cmd_set_remote_access(aaudio, AAUDIO_REMOTE_ACCESS_ON)) {
+        aaudio->resume_deferred = false;
+        dev_err(aaudio->dev, "Deferred remote access enable failed\n");
+        return;
+    }
+
+    aaudio->resume_deferred = false;
+    dev_info(aaudio->dev, "resume deferred path complete\n");
+}
+
+void aaudio_resume_post_vhci(struct aaudio_device *aaudio)
+{
+    if (!aaudio || !aaudio->resume_deferred)
+        return;
+
+    schedule_work(&aaudio->resume_work);
 }
 
 static void aaudio_reset_stream(struct aaudio_stream *stream)

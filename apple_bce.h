@@ -3,6 +3,7 @@
 
 #include <linux/pci.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include "mailbox.h"
 #include "queue.h"
 #include "vhci/vhci.h"
@@ -20,7 +21,7 @@ struct apple_bce_device {
     void __iomem *reg_mem_mb;
     void __iomem *reg_mem_dma;
     struct bce_mailbox mbox;
-    struct bce_timestamp timestamp;
+    struct bce_xhci_pm xhci_pm;
     struct bce_queue *queues[BCE_MAX_QUEUE_COUNT];
     struct spinlock queues_lock;
     struct ida queue_ida;
@@ -32,8 +33,14 @@ struct apple_bce_device {
     dma_addr_t saved_data_dma_addr;
     void *saved_data_dma_ptr;
     size_t saved_data_dma_size;
+    u32 fw_version;
+    bool stateful_suspend_valid;
+    bool no_state_fallback;
+    bool mailbox_channel_active;
+    struct mutex pm_lock;
 
     struct bce_vhci vhci;
+    struct aaudio_device *aaudio;
 };
 
 extern struct apple_bce_device *global_bce;
