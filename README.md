@@ -30,7 +30,6 @@ Switch back to the dGPU default by changing `y` to `n` and rebooting.
 
 - `MacBookAir8,1`
 - `MacBookAir9,1`
-- `MacBookPro15,1`
 - `MacBookPro16,1`
 - `MacBookPro16,2`
 - `MacBookPro16,4`
