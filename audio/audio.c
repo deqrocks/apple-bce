@@ -185,10 +185,37 @@ static void aaudio_remove(struct pci_dev *dev)
 static int aaudio_suspend(struct device *dev)
 {
     struct aaudio_device *aaudio = pci_get_drvdata(to_pci_dev(dev));
+    struct aaudio_subdevice *sdev;
+    size_t i;
     int status;
 
     cancel_work_sync(&aaudio->resume_work);
     aaudio->resume_deferred = false;
+
+    /* Suspend PCM streams */
+    list_for_each_entry(sdev, &aaudio->subdevice_list, list) {
+        bool stopped_io = false;
+
+        for (i = 0; i < sdev->out_stream_cnt; i++) {
+            if (!sdev->out_streams[i].started)
+                continue;
+            stopped_io = true;
+            sdev->out_streams[i].started = 0;
+        }
+
+        for (i = 0; i < sdev->in_stream_cnt; i++) {
+            if (!sdev->in_streams[i].started)
+                continue;
+            stopped_io = true;
+            sdev->in_streams[i].started = 0;
+        }
+
+        if (stopped_io)
+            aaudio_cmd_stop_io(sdev->a, sdev->dev_id);
+
+        if (sdev->pcm)
+            snd_pcm_suspend_all(sdev->pcm);
+    }
 
     dev_info(aaudio->dev, "suspend entry\n");
 
