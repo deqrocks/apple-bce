@@ -56,11 +56,14 @@ struct bce_queue_cmdq_result_el {
     struct completion cmpl;
     u32 status;
     u64 result;
+    u32 slot;
+    u32 generation;
 };
 struct bce_queue_cmdq {
     struct bce_queue_sq *sq;
     struct spinlock lck;
     struct bce_queue_cmdq_result_el **tres;
+    u32 *slot_gen;
 };
 
 struct bce_queue_memcfg {
@@ -172,6 +175,8 @@ u32 bce_cmd_flush_memory_queue(struct bce_queue_cmdq *cmdq, u16 qid);
 struct bce_queue_cq *bce_create_cq(struct apple_bce_device *dev, u32 el_count);
 struct bce_queue_sq *bce_create_sq(struct apple_bce_device *dev, struct bce_queue_cq *cq, const char *name, u32 el_count,
         int direction, bce_sq_completion compl, void *userdata);
+struct bce_queue_sq *bce_create_sq_with_flags(struct apple_bce_device *dev, struct bce_queue_cq *cq, const char *name,
+        u32 el_count, u16 flags, bce_sq_completion compl, void *userdata);
 void bce_destroy_cq(struct apple_bce_device *dev, struct bce_queue_cq *cq);
 void bce_destroy_sq(struct apple_bce_device *dev, struct bce_queue_sq *sq);
 

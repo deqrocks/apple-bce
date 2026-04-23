@@ -8,6 +8,8 @@ struct bce_queue_cq *bce_alloc_cq(struct apple_bce_device *dev, int qid, u32 el_
 {
     struct bce_queue_cq *q;
     q = kzalloc(sizeof(struct bce_queue_cq), GFP_KERNEL);
+    if (!q)
+        return NULL;
     q->qid = qid;
     q->type = BCE_QUEUE_CQ;
     q->el_count = el_count;
@@ -106,6 +108,8 @@ struct bce_queue_sq *bce_alloc_sq(struct apple_bce_device *dev, int qid, u32 el_
 {
     struct bce_queue_sq *q;
     q = kzalloc(sizeof(struct bce_queue_sq), GFP_KERNEL);
+    if (!q)
+        return NULL;
     q->qid = qid;
     q->type = BCE_QUEUE_SQ;
     q->el_size = el_size;
@@ -119,8 +123,11 @@ struct bce_queue_sq *bce_alloc_sq(struct apple_bce_device *dev, int qid, u32 el_
     atomic_set(&q->available_commands, el_count - 1);
     init_completion(&q->available_command_completion);
     atomic_set(&q->available_command_completion_waiting_count, 0);
-    if (!q->data) {
+    if (!q->data || !q->completion_data) {
         pr_err("DMA queue memory alloc failed\n");
+        if (q->data)
+            dma_free_coherent(&dev->pci->dev, el_count * el_size, q->data, q->dma_handle);
+        kfree(q->completion_data);
         kfree(q);
         return NULL;
     }
@@ -140,6 +147,7 @@ void bce_get_sq_memcfg(struct bce_queue_sq *sq, struct bce_queue_cq *cq, struct 
 void bce_free_sq(struct apple_bce_device *dev, struct bce_queue_sq *sq)
 {
     dma_free_coherent(&dev->pci->dev, sq->el_count * sq->el_size, sq->data, sq->dma_handle);
+    kfree(sq->completion_data);
     kfree(sq);
 }
 
@@ -198,6 +206,8 @@ struct bce_queue_cmdq *bce_alloc_cmdq(struct apple_bce_device *dev, int qid, u32
 {
     struct bce_queue_cmdq *q;
     q = kzalloc(sizeof(struct bce_queue_cmdq), GFP_KERNEL);
+    if (!q)
+        return NULL;
     q->sq = bce_alloc_sq(dev, qid, BCE_CMD_SIZE, el_count, bce_cmdq_completion, q);
     if (!q->sq) {
         kfree(q);
@@ -206,6 +216,14 @@ struct bce_queue_cmdq *bce_alloc_cmdq(struct apple_bce_device *dev, int qid, u32
     spin_lock_init(&q->lck);
     q->tres = kzalloc(sizeof(struct bce_queue_cmdq_result_el*) * el_count, GFP_KERNEL);
     if (!q->tres) {
+        bce_free_sq(dev, q->sq);
+        kfree(q);
+        return NULL;
+    }
+    q->slot_gen = kzalloc(sizeof(u32) * el_count, GFP_KERNEL);
+    if (!q->slot_gen) {
+        kfree(q->tres);
+        bce_free_sq(dev, q->sq);
         kfree(q);
         return NULL;
     }
@@ -215,6 +233,7 @@ struct bce_queue_cmdq *bce_alloc_cmdq(struct apple_bce_device *dev, int qid, u32
 void bce_free_cmdq(struct apple_bce_device *dev, struct bce_queue_cmdq *cmdq)
 {
     bce_free_sq(dev, cmdq->sq);
+    kfree(cmdq->slot_gen);
     kfree(cmdq->tres);
     kfree(cmdq);
 }
@@ -228,13 +247,11 @@ void bce_cmdq_completion(struct bce_queue_sq *q)
     spin_lock(&cmdq->lck);
     while ((result = bce_next_completion(q))) {
         el = cmdq->tres[cmdq->sq->head];
-        if (el) {
+        if (el && el->generation == cmdq->slot_gen[cmdq->sq->head]) {
             el->result = result->result;
             el->status = result->status;
             mb();
             complete(&el->cmpl);
-        } else {
-            pr_err("apple-bce: Unexpected command queue completion\n");
         }
         cmdq->tres[cmdq->sq->head] = NULL;
         bce_notify_submission_complete(q);
@@ -254,18 +271,29 @@ static __always_inline void *bce_cmd_start(struct bce_queue_cmdq *cmdq, struct b
         return NULL;
 
     spin_lock(&cmdq->lck);
+    res->slot = cmdq->sq->tail;
+    res->generation = cmdq->slot_gen[cmdq->sq->tail];
     cmdq->tres[cmdq->sq->tail] = res;
     ret = bce_next_submission(cmdq->sq);
     return ret;
 }
 
-static __always_inline void bce_cmd_finish(struct bce_queue_cmdq *cmdq, struct bce_queue_cmdq_result_el *res)
+static __always_inline int bce_cmd_finish(struct bce_queue_cmdq *cmdq, struct bce_queue_cmdq_result_el *res)
 {
     bce_submit_to_device(cmdq->sq);
     spin_unlock(&cmdq->lck);
 
-    wait_for_completion(&res->cmpl);
+    if (!wait_for_completion_timeout(&res->cmpl, msecs_to_jiffies(5000))) {
+        pr_err("apple-bce: command queue timeout (slot %u)\n", res->slot);
+        spin_lock(&cmdq->lck);
+        cmdq->tres[res->slot] = NULL;
+        cmdq->slot_gen[res->slot]++;
+        spin_unlock(&cmdq->lck);
+        bce_notify_submission_complete(cmdq->sq);
+        return -ETIMEDOUT;
+    }
     mb();
+    return 0;
 }
 
 u32 bce_cmd_register_queue(struct bce_queue_cmdq *cmdq, struct bce_queue_memcfg *cfg, const char *name, bool isdirout)
@@ -289,7 +317,8 @@ u32 bce_cmd_register_queue(struct bce_queue_cmdq *cmdq, struct bce_queue_memcfg 
     cmd->addr = cfg->addr;
     cmd->length = cfg->length;
 
-    bce_cmd_finish(cmdq, &res);
+    if (bce_cmd_finish(cmdq, &res))
+        return (u32)-1;
     return res.status;
 }
 
@@ -302,7 +331,8 @@ u32 bce_cmd_unregister_memory_queue(struct bce_queue_cmdq *cmdq, u16 qid)
     cmd->cmd = BCE_CMD_UNREGISTER_MEMORY_QUEUE;
     cmd->flags = 0;
     cmd->qid = qid;
-    bce_cmd_finish(cmdq, &res);
+    if (bce_cmd_finish(cmdq, &res))
+        return (u32)-1;
     return res.status;
 }
 
@@ -315,7 +345,8 @@ u32 bce_cmd_flush_memory_queue(struct bce_queue_cmdq *cmdq, u16 qid)
     cmd->cmd = BCE_CMD_FLUSH_MEMORY_QUEUE;
     cmd->flags = 0;
     cmd->qid = qid;
-    bce_cmd_finish(cmdq, &res);
+    if (bce_cmd_finish(cmdq, &res))
+        return (u32)-1;
     return res.status;
 }
 
@@ -386,6 +417,13 @@ struct bce_queue_sq *bce_create_sq(struct apple_bce_device *dev, struct bce_queu
     dev->queues[qid] = (struct bce_queue *) sq;
     spin_unlock(&dev->queues_lock);
     return sq;
+}
+
+struct bce_queue_sq *bce_create_sq_with_flags(struct apple_bce_device *dev, struct bce_queue_cq *cq, const char *name,
+        u32 el_count, u16 flags, bce_sq_completion compl, void *userdata)
+{
+    int direction = (flags & 1) ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+    return bce_create_sq(dev, cq, name, el_count, direction, compl, userdata);
 }
 
 void bce_destroy_cq(struct apple_bce_device *dev, struct bce_queue_cq *cq)
