@@ -8,6 +8,9 @@ These kernel parameters have to be set in Linux commandline:
 
 - `mem_sleep_default=deep` This is S3. S2 and 4 should also work
 - `pcie_ports=auto` as override for hardcoded arguments (if exist)
+- `pm_async=off` needed on some machines to make pm ordering sequential
+- `acpi_osi=!Darwin acpi_osi=Linux` for using the correct ACPI tables
+
 
 
 ## Notes for dGPU models
