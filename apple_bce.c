@@ -642,8 +642,8 @@ static void __exit apple_bce_module_exit(void)
 }
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("MrARM");
+MODULE_AUTHOR("MrARM/modified by André Eikmeyer");
 MODULE_DESCRIPTION("Apple BCE Driver");
-MODULE_VERSION("0.04");
+MODULE_VERSION("0.041");
 module_init(apple_bce_module_init);
 module_exit(apple_bce_module_exit);

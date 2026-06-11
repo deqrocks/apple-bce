@@ -63,7 +63,28 @@ Example for Fedora / dracut-based distros:
 sudo dracut -f
 ```
 
-Don't forget to build and install the other two repos mentioned above.
+## DKMS
+
+Install the source tree and register the module with DKMS:
+
+```bash
+version=0.041
+sudo install -d "/usr/src/apple-bce-${version}"
+git archive --format=tar HEAD | sudo tar -x -C "/usr/src/apple-bce-${version}"
+sudo dkms add -m apple-bce -v "${version}"
+sudo dkms install -m apple-bce -v "${version}"
+```
+
+DKMS will automatically rebuild the module for newly installed kernels.
+Rebuild the initramfs afterwards if your distribution includes this module
+there.
+
+To remove the DKMS installation:
+
+```bash
+sudo dkms remove -m apple-bce -v 0.041 --all
+sudo rm -rf /usr/src/apple-bce-0.041
+```
 
 ## Support
 
