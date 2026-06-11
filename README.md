@@ -7,65 +7,145 @@ Buffer Copy Engine fork for Intel Macs with a T2 chip with stateful and no-state
 These kernel parameters have to be set in Linux commandline:
 
 - `mem_sleep_default=deep` This is S3. S2 and 4 should also work
-- `pcie_ports=auto` as override for hardcoded arguments (if exist)
-- `pm_async=off` needed on some machines to make pm ordering sequential
+- `pm_async=off` needed on some machines to make pm ordering sequential. Since V0.04 it should work without it.
 - `acpi_osi=!Darwin acpi_osi=Linux` for using the correct ACPI tables
 
 
+# Workarounds
+
+A fixed apple-bce doesn't fix suspend. While it was broken for many years, developers of other T2 patches/drivers did not take care of implementing suspend/resume methods because suspend was broken by apple-bce anyways. Also Apple never cared for Linux (on some Macbooks ACPI tables have real issues). And finally we have the T2 and Apple-modified hardware/platform to deal with. Not all hope is lost though. We can work around most of it using systemd units.
+The below units will help you around the roughest cliffs. Note that you can combine them into one unit. Also note the minus sign in for example `ExecStart=-/usr/bin...` will let the systemd unit continue in case of error. For example if you haven't tiny-dfr installed, the service should still continue to execute - with cosmetic errors in journal. Feel free to remove what you don't need.
+The code blocks are full commands. They will create the units and activate them. Copy them, modify them to your needs if you want and execute them. But don't forget the important bits like daemon-reload and systemctl enable.
 
 ## Notes for dGPU models
 
 On dGPU Macs, suspend may still fail or resume may take very long unless the iGPU is set as the default GPU.
-
-- Follow the iGPU setup from `https://wiki.t2linux.org/guides/hybrid-graphics/#enabling-the-igpu`
-- On Fedora, rebuild both grub and initramfs after changing kernel parameters or module config
-- If resume still hangs, try `modprobe.blacklist=amdgpu`
-- Blacklisting `amdgpu` can make suspend work, but you will lose normal dGPU use and external monitor support
-- `apple-gmux` can be used to force the iGPU as default:
+The 15,1 is notorious for a dead dGPU on resume (black screen with running fans). Do this:
 
 ```bash
 echo "options apple-gmux force_igd=y" | sudo tee /etc/modprobe.d/apple-gmux.conf
 ```
 
-Switch back to the dGPU default by changing `y` to `n` and rebooting.
+Then create a systemd service to unload amdgpu when suspending by copy/pasting the whole code block below:
+```
+sudo tee /etc/systemd/system/amdgpu-suspend-fix.service >/dev/null <<'EOF'
+[Unit]
+Description=Unload and Reload Modules amdgpu for Suspend and Resume
+Before=sleep.target
+StopWhenUnneeded=yes
 
-## Tested Macs
+[Service]
+User=root
+Type=oneshot
+RemainAfterExit=yes
 
-- `MacBookAir8,1`
-- `MacBookAir9,1`
-- `MacBookPro16,1`
-- `MacBookPro16,2`
-- `MacBookPro16,4`
-- `iMac19,1`
-- `Macmini8,1`
+ExecStart=-/usr/bin/rmmod -f amdgpu
 
-## Build
+ExecStop=-/usr/bin/modprobe amdgpu
 
-```bash
-make
+[Install]
+WantedBy=sleep.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable amdgpu-suspend-fix.service
 ```
 
-## Deploy
+
+## Notes for Macbooks with Touchbar
+
+The touchbar/keyboard drivers are missing proper PM paths and the Touchbar will be broken after resuming. On some macs the kbd backlight stops working. On Macs with tiny-dfr installed, tiny DFR will sit on old FD's before suspend.
+
+Run
+
+`journalctl -b --grep="Product: Touch Bar Display"`
+ 
+If needed, replace any occurencies of `3-6`  with the number from the output of the command above.
+
+```
+sudo tee /etc/systemd/system/touchbar-suspend-fix.service >/dev/null <<'EOF'
+[Unit]
+Description=Unload and Reload Modules for Suspend and Resume
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+User=root
+Type=oneshot
+RemainAfterExit=yes
+
+ExecStart=-/usr/bin/sh -c "/usr/bin/echo 0 | /usr/bin/tee /sys/class/leds/apple::kbd_backlight/brightness" # this is for butterfly keyboards 
+ExecStart=-/usr/bin/sh -c "/usr/bin/echo 0 | /usr/bin/tee /sys/class/leds/:white:kbd_backlight/brightness" # this is for magic keyboards 
+ExecStart=-/usr/bin/systemctl stop tiny-dfr.service
+ExecStart=-/usr/bin/modprobe -r hid_appletb_kbd
+
+ExecStop=-/usr/bin/modprobe hid_appletb_kbd
+ExecStop=-/usr/bin/sh -c 'echo 0 > /sys/bus/usb/devices/3-6/bConfigurationValue'
+ExecStop=-/usr/bin/sleep 1
+ExecStop=-/usr/bin/sh -c 'echo 2 > /sys/bus/usb/devices/3-6/bConfigurationValue'
+ExecStop=-/usr/bin/udevadm settle
+ExecStop=-/usr/bin/systemctl restart tiny-dfr.service
+ExecStopPost=-/usr/bin/sh -c "/usr/bin/echo 200 | /usr/bin/tee /sys/class/leds/apple::kbd_backlight/brightness"
+ExecStopPost=-/usr/bin/sh -c "/usr/bin/echo 200 | /usr/bin/tee /sys/class/leds/:white:kbd_backlight/brightness"
+
+
+[Install]
+WantedBy=sleep.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable touchbar-suspend-fix.service
+```
+
+## Notes for Macbooks with BCM4377 Wifi
+
+The 4377 chip is notorious for not managing to transition between power states. Thus it will refuse to enter sleep and wake the system again with all VHCI devices, like keyboard and trackpad not working. Do this:
+
+```
+sudo tee /etc/systemd/system/4377-suspend-fix.service >/dev/null <<'EOF'
+[Unit]
+Description=Unload and Reload BCM4377 for Suspend and Resume
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+User=root
+Type=oneshot
+RemainAfterExit=yes
+
+ExecStart=-/usr/bin/rmmod hci_bcm4377
+ExecStart=-/usr/bin/rmmod brcmfmac_wcc
+ExecStart=-/usr/bin/rmmod brcmfmac
+
+ExecStop=-/usr/bin/modprobe brcmfmac
+ExecStop=-/usr/bin/modprobe brcmfmac_wcc
+ExecStop=-/usr/bin/modprobe hci_bcm4377
+
+
+[Install]
+WantedBy=sleep.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable 4377-suspend-fix.service
+```
+
+
+## Build and deploy
+
+Download the zip file and go into the extracted apple-bce folder with terminal. Type
 
 ```bash
-sudo make install
+make && sudo make install
 sudo depmod -a
 sudo reboot
 ```
-
-Rebuild grub if your distro uses grub.
-
-Rebuild initramfs if your distro includes these modules there.
-
-Example for Fedora / dracut-based distros:
-
-```bash
-sudo dracut -f
-```
+After reboot type `modinfo apple-bce`. The output should show a version number > `0.04` and `author: MrARM/modified by André Eikmeyer`
+ 
 
 ## DKMS
 
-Install the source tree and register the module with DKMS:
+Install the source tree and register the module with DKMS (apple-bce version 0.041 as example here):
 
 ```bash
 version=0.041
@@ -76,8 +156,6 @@ sudo dkms install -m apple-bce -v "${version}"
 ```
 
 DKMS will automatically rebuild the module for newly installed kernels.
-Rebuild the initramfs afterwards if your distribution includes this module
-there.
 
 To remove the DKMS installation:
 
@@ -91,8 +169,3 @@ sudo rm -rf /usr/src/apple-bce-0.041
 If this work helps you and you want to support it:
 
 https://www.paypal.com/paypalme/negmaster
-
-## Credits
-
-- MCMrArm https://github.com/MCMrARM
-- Antoine Sidem https://github.com/clanoftheducks
