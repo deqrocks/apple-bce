@@ -687,6 +687,6 @@ static void __exit apple_bce_module_exit(void)
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("André Eikmeyer <andre.eikmeyer@gmail.com>");
 MODULE_DESCRIPTION("T2 BCE-VHCI-Audio Driver based on MrArm's apple-bce");
-MODULE_VERSION("0.05");
+MODULE_VERSION("0.06");
 module_init(apple_bce_module_init);
 module_exit(apple_bce_module_exit);
