@@ -210,7 +210,7 @@ static snd_pcm_uframes_t aaudio_pcm_pointer(struct snd_pcm_substream *substream)
     snd_pcm_sframes_t buffer_time_length;
 
     if (!stream->started || stream->waiting_for_first_ts) {
-        /* the pr_info about pcm pointer was removed because it's a normal state transition*/
+        pr_debug("aaudio_pcm_pointer while not started\n");
         return 0;
     }
 

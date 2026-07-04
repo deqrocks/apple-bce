@@ -149,7 +149,6 @@ static void aaudio_handle_reply(struct aaudio_bce *b, struct aaudio_msg *reply)
 static void aaudio_bce_out_queue_completion(struct bce_queue_sq *sq)
 {
     while (bce_next_completion(sq)) {
-        //pr_info("aaudio: Send confirmed\n");
         bce_notify_submission_complete(sq);
     }
 }

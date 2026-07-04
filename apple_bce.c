@@ -56,7 +56,7 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
     int status = 0;
     int nvec;
 
-    pr_info("apple-bce: capturing our device\n");
+    pr_debug("apple-bce: capturing our device\n");
 
     if (pci_enable_device(dev))
         return -ENODEV;
@@ -132,10 +132,10 @@ static int apple_bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     if ((status = bce_fw_version_handshake(bce)))
         goto fail_ts;
-    pr_info("apple-bce: handshake done\n");
+    pr_debug("apple-bce: handshake done\n");
 
     if ((status = bce_create_command_queues(bce))) {
-        pr_info("apple-bce: Creating command queues failed\n");
+        pr_err("apple-bce: Creating command queues failed\n");
         goto fail_ts;
     }
 
@@ -382,9 +382,40 @@ static void apple_bce_remove(struct pci_dev *dev)
     kfree(bce);
 }
 
+static void apple_bce_shutdown(struct pci_dev *dev)
+{
+    struct apple_bce_device *bce = pci_get_drvdata(dev);
+    int status;
+
+    if (!bce)
+        return;
+
+    mutex_lock(&bce->pm_lock);
+    bce->is_being_removed = true;
+    bce->stateful_suspend_valid = false;
+    bce->no_state_fallback = false;
+    bce->vhci.no_state_resume = false;
+
+    /*
+     * Do not tear down allocations here;
+     * just leave the T2 side quiet while command queues and mailbox access are
+     * still valid: USB HCD off, XHCI PM sentinel written, mailbox drained.
+     */
+    bce_vhci_shutdown(&bce->vhci);
+    bce_xhci_pm_stop(&bce->xhci_pm);
+
+    if (bce->mailbox_channel_active) {
+        status = bce_pm_channel_pause(bce);
+        if (status)
+            pr_warn("apple-bce: shutdown mailbox quiesce failed: %d\n", status);
+    }
+
+    mutex_unlock(&bce->pm_lock);
+}
+
 static int bce_pm_suspend_fallback_no_state(struct apple_bce_device *bce)
 {
-    pr_info("apple-bce: suspend: forcing SLEEP_NO_STATE (no reply expected)\n");
+    pr_debug("apple-bce: suspend: forcing SLEEP_NO_STATE (no reply expected)\n");
     if (bce_mailbox_send_no_reply_locked(&bce->mbox, BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0))) {
         pr_err("apple-bce: suspend: SLEEP_NO_STATE send failed\n");
         return -EIO;
@@ -416,7 +447,7 @@ static int bce_pm_suspend_try_state(struct apple_bce_device *bce)
     }
 
     if (BCE_MB_TYPE(resp) == BCE_MB_SAVE_RESTORE_STATE_COMPLETE) {
-        pr_info("apple-bce: suspend: remote response: restore state saved  \n");
+        pr_debug("apple-bce: suspend: remote response: restore state saved\n");
         bce->stateful_suspend_valid = true;
         return 0;
     }
@@ -467,7 +498,7 @@ static int apple_bce_suspend(struct device *dev)
     struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
     int status;
 
-    pr_info("apple-bce: suspend: entry\n");
+    pr_debug("apple-bce: suspend: entry\n");
     mutex_lock(&bce->pm_lock);
 
     bce->stateful_suspend_valid = false;
@@ -501,7 +532,7 @@ static int apple_bce_suspend(struct device *dev)
     }
 
     /* Current Linux path treats the traced 0x19 not-ready reply as stateful reject. */
-    pr_info("apple-bce: suspend: stateful path not ready, falling back to no-state\n");
+    pr_debug("apple-bce: suspend: stateful path not ready, falling back to no-state\n");
     bce_vhci_remove_hcd(&bce->vhci);
     status = bce_pm_suspend_fallback_no_state(bce);
     if (!status) {
@@ -513,7 +544,7 @@ static int apple_bce_suspend(struct device *dev)
 
 out_unlock:
     mutex_unlock(&bce->pm_lock);
-    pr_info("apple-bce: suspend: exit status=%d stateful_valid=%d no_state_resume=%d no_state_fallback=%d\n",
+    pr_debug("apple-bce: suspend: exit status=%d stateful_valid=%d no_state_resume=%d no_state_fallback=%d\n",
             status, bce->stateful_suspend_valid, bce->vhci.no_state_resume, bce->no_state_fallback);
     return status;
 }
@@ -524,7 +555,7 @@ static int apple_bce_resume(struct device *dev)
     int status;
     bool used_stateful;
 
-    pr_info("apple-bce: resume: entry\n");
+    pr_debug("apple-bce: resume: entry\n");
     mutex_lock(&bce->pm_lock);
 
     pci_set_master(bce->pci);
@@ -532,7 +563,7 @@ static int apple_bce_resume(struct device *dev)
 
     /* Windows resumes from the suspend result, not a preselected mode. */
     used_stateful = bce_stateful_supported(bce) && bce->stateful_suspend_valid;
-    pr_info("apple-bce: resume path: %s\n", used_stateful ? "stateful" : "no-state");
+    pr_debug("apple-bce: resume path: %s\n", used_stateful ? "stateful" : "no-state");
     if (used_stateful)
         status = bce_pm_resume_stateful(bce);
     else
@@ -547,27 +578,37 @@ static int apple_bce_resume(struct device *dev)
 
 out_unlock:
     mutex_unlock(&bce->pm_lock);
-    pr_info("apple-bce: resume: exit status=%d path=%s stateful_valid=%d no_state_resume=%d no_state_fallback=%d\n",
+    pr_debug("apple-bce: resume: exit status=%d path=%s stateful_valid=%d no_state_resume=%d no_state_fallback=%d\n",
             status, used_stateful ? "stateful" : "no-state",
             bce->stateful_suspend_valid, bce->vhci.no_state_resume, bce->no_state_fallback);
     return status;
+}
+
+static int apple_bce_prepare(struct device *dev)
+{
+    /*
+     * Force PCI PM to run our real suspend/resume callbacks instead of
+     * short-cutting an "already runtime suspended" device through complete().
+     * The T2 mailbox save/restore handshake lives in those callbacks.
+     */
+    return 0;
 }
 
 static void apple_bce_complete(struct device *dev)
 {
     struct apple_bce_device *bce = pci_get_drvdata(to_pci_dev(dev));
 
-    pr_info("apple-bce: complete: entry no_state_fallback=%d no_state_resume=%d\n",
+    pr_debug("apple-bce: complete: entry no_state_fallback=%d no_state_resume=%d\n",
             bce->no_state_fallback, bce->vhci.no_state_resume);
     if (bce->no_state_fallback && bce->vhci.no_state_resume) {
         /* Re-add the VHCI HCD after the PM core completed resume ordering. */
-        pr_info("apple-bce: complete: scheduling VHCI HCD re-add after no-state wake\n");
+        pr_debug("apple-bce: complete: scheduling VHCI HCD re-add after no-state wake\n");
         queue_work(bce->vhci.tq_state_wq, &bce->vhci.w_add_hcd);
         bce->no_state_fallback = false;
     }
 
     aaudio_resume_post_vhci(bce->aaudio);
-    pr_info("apple-bce: complete: exit\n");
+    pr_debug("apple-bce: complete: exit\n");
 }
 
 static struct pci_device_id apple_bce_ids[  ] = {
@@ -578,6 +619,7 @@ static struct pci_device_id apple_bce_ids[  ] = {
 MODULE_DEVICE_TABLE(pci, apple_bce_ids);
 
 struct dev_pm_ops apple_bce_pci_driver_pm = {
+        .prepare = apple_bce_prepare,
         .suspend = apple_bce_suspend,
         .resume = apple_bce_resume,
         .complete = apple_bce_complete
@@ -587,6 +629,7 @@ struct pci_driver apple_bce_pci_driver = {
         .id_table = apple_bce_ids,
         .probe = apple_bce_probe,
         .remove = apple_bce_remove,
+        .shutdown = apple_bce_shutdown,
         .driver = {
                 .pm = &apple_bce_pci_driver_pm
         }
@@ -642,8 +685,8 @@ static void __exit apple_bce_module_exit(void)
 }
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("MrARM/modified by André Eikmeyer");
-MODULE_DESCRIPTION("Apple BCE Driver");
-MODULE_VERSION("0.041");
+MODULE_AUTHOR("André Eikmeyer <andre.eikmeyer@gmail.com>");
+MODULE_DESCRIPTION("T2 BCE-VHCI-Audio Driver based on MrArm's apple-bce");
+MODULE_VERSION("0.05");
 module_init(apple_bce_module_init);
 module_exit(apple_bce_module_exit);
