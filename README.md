@@ -1,3 +1,8 @@
+# This repo is no longer maintained
+## t2bce is the replacement for apple-bce
+apple-bce is now deprecated and was rewritten to t2bce, which is prepared to be upstreamed:
+https://github.com/deqrocks/t2bce
+
 # apple-bce
 
 Buffer Copy Engine fork for Intel Macs with a T2 chip with stateful and no-state resume support.
